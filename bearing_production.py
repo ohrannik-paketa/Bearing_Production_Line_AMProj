@@ -4,7 +4,8 @@ bearing_production.py
 Parallel simulation of a ball bearing production line.
 Includes assembly part-loss and packaging faults.
 """
-
+import sys
+import msvcrt
 import random
 import time
 import threading
@@ -45,6 +46,17 @@ class Station(ABC):
         self.defect_rate = defect_rate
         self.processed = 0
         self.rejected = 0
+        self.run_flag = None
+        self.stop_event = None
+
+    def _sleep(self, duration: float):
+        """Interruptible sleep allowing for E-Stop freezes and Soft Halts."""
+        elapsed = 0.0
+        while elapsed < duration:
+            if self.run_flag: self.run_flag.wait()
+            if self.stop_event and self.stop_event.is_set(): break
+            time.sleep(0.05)
+            elapsed += 0.05
 
     @abstractmethod
     def process(self, item):
@@ -77,13 +89,13 @@ class ComponentMaker(Station):
         part = Component(name=self.component_name, serial=self._counter, quality=quality, defect_reason=reason)
         status = f"-> {part.quality.name}" + (f" ({part.defect_reason})" if reason else "")
         self.log(f"produced {part.name}#{part.serial} {status}")
-        time.sleep(0.1) 
+        self._sleep(0.1) 
         return part
 
 class QualityControl(Station):
     def process(self, item: Component) -> Optional[Component]:
         self.processed += 1
-        time.sleep(0.05) 
+        self._sleep(0.05)
         if item.quality is Quality.DEFECTIVE:
             self.rejected += 1
             self.log(f"REJECT {item.name}#{item.serial} - Reason: {item.defect_reason}")
@@ -107,13 +119,13 @@ class AssemblyStation(Station):
         )
         status = f"-> {bearing.quality.name}" + (f" ({bearing.defect_reason})" if reason else "")
         self.log(f"assembled Bearing#{bearing.serial} {status}")
-        time.sleep(0.15)
+        self._sleep(0.15)
         return bearing
 
 class FinalInspection(Station):
     def process(self, bearing: BallBearing) -> Optional[BallBearing]:
         self.processed += 1
-        time.sleep(0.05)
+        self._sleep(0.05)
         if not bearing.is_complete() or bearing.quality is Quality.DEFECTIVE:
             self.rejected += 1
             reason = bearing.defect_reason or "Incomplete assembly"
@@ -128,7 +140,7 @@ class Packaging(Station):
 
     def process(self, bearing: BallBearing) -> Optional[BallBearing]:
         self.processed += 1
-        time.sleep(0.1)
+        self._sleep(0.1)
         # Added packaging fault handling
         quality, reason = self._maybe_defect(["Missing grease application", "Carton jam / Packaging destroyed", "Finished good dropped"])
         
@@ -154,13 +166,21 @@ class ProductionLine:
         self.final_qc = FinalInspection(name="Final QC")
         self.packaging = Packaging()
         self.shipped: List[BallBearing] = []
+        # Thread flags for E-Stop and Soft Halt
+        self.run_flag = threading.Event()
+        self.run_flag.set()
+        self.stop_event = threading.Event()
+
+        # Pass flags to all stations
+        all_stations = [*self.makers.values(), *self.qcs.values(), self.assembly, self.final_qc, self.packaging]
+        for s in all_stations:
+            s.run_flag = self.run_flag
+            s.stop_event = self.stop_event
 
     def _produce_lane(self, name: str) -> None:
         while not self.bins[name]:
+            if self.stop_event.is_set(): return
             raw = self.makers[name].process()
-            inspected = self.qcs[name].process(raw)
-            if inspected is not None:
-                self.bins[name].append(inspected)
 
     def _refill_bins(self) -> None:
         threads = []
@@ -172,6 +192,9 @@ class ProductionLine:
             t.join()
 
     def _assemble_one(self) -> Optional[BallBearing]:
+        for n in self.COMPONENT_NAMES:
+            if not self.bins[n]:
+                return Nonee
         parts = {n: self.bins[n].popleft() for n in self.COMPONENT_NAMES}
         bearing = self.assembly.process(parts)
         bearing = self.final_qc.process(bearing)
@@ -182,11 +205,10 @@ class ProductionLine:
     def run(self, target: int) -> None:
         print(f"\n=== Starting parallel production: target = {target} bearings ===\n")
         while len(self.shipped) < target:
+            if self.stop_event.is_set(): break
             self._refill_bins()
+            if self.stop_event.is_set(): break
             bearing = self._assemble_one()
-            if bearing is not None:
-                self.shipped.append(bearing)
-        self._report()
 
     def _report(self) -> None:
         print("\n=== Production report ===")
@@ -196,5 +218,35 @@ class ProductionLine:
         print(f"\nShipped bearings: {len(self.shipped)}")
 
 if __name__ == "__main__":
-    random.seed(42) 
-    ProductionLine().run(target=5)
+    random.seed(42)
+    line = ProductionLine()
+    
+    # Run production in a background thread to keep the main thread free for controls
+    prod_thread = threading.Thread(target=line.run, args=(20,), daemon=True)
+    prod_thread.start()
+
+    print("\n--- CONTROLS (Press instantly, no Enter needed): [E]=E-Stop | [R]=Resume | [S]=Soft Halt | [Q]=Quit ---\n")
+    
+    # Non-blocking listener loop
+    while prod_thread.is_alive():
+        if msvcrt.kbhit(): # Instantly checks if a key is being pressed
+            key = msvcrt.getch().decode('utf-8', errors='ignore').lower()
+            
+            if key == 'e':
+                line.run_flag.clear()
+                print("\n[!] E-STOP ENGAGED - ALL MACHINERY FROZEN [!]\n")
+            elif key == 'r':
+                line.run_flag.set()
+                print("\n[>] PRODUCTION RESUMED\n")
+            elif key == 's':
+                line.stop_event.set()
+                line.run_flag.set() # Unfreeze in case E-Stop was active
+                print("\n[i] SOFT HALT SIGNALED - FINISHING CURRENT CYCLE...\n")
+            elif key == 'q':
+                line.stop_event.set()
+                line.run_flag.set()
+                break
+                
+        time.sleep(0.05) # Keeps the CPU from maxing out while waiting for input
+
+    prod_thread.join()
