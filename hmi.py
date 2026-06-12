@@ -45,7 +45,8 @@ class InstrumentedLine:
         self.serial_counters = {n: 0 for n in self.components}
         self.bearing_counter = 0
         self.shipped = 0
-        
+        self._run_flag = threading.Event()
+        self._run_flag.set()
         # Updated defect reasons mapped to the new backend logic
         self.defect_reasons = {
             "outer_ring": "Machining tolerance exceeded",
@@ -59,7 +60,13 @@ class InstrumentedLine:
     def _stage(self, key: str, component: str) -> None:
         if not self._stop.is_set():
             self._q.put({"type": EVT_STAGE, "stage": key, "component": component})
-            time.sleep(STEP_DELAY)
+            # Replaces time.sleep() with an interruptible tick loop
+            elapsed = 0
+            while elapsed < STEP_DELAY:
+                self._run_flag.wait()  # Blocks instantly if E-Stop clears this flag
+                if self._stop.is_set(): break
+                time.sleep(0.05)
+                elapsed += 0.05
 
     def _maybe_fail(self, threshold: float = 0.05):
         return random.random() < threshold
@@ -188,8 +195,11 @@ class HMI(tk.Tk):
         btn_frame.grid(row=0, column=2, sticky="e")
         self._btn_start = tk.Button(btn_frame, text="INITIATE", bg=PANEL_BORDER, fg=OK_GREEN, activebackground=OK_GREEN, activeforeground="#000", font=("Consolas", 12, "bold"), width=12, relief="flat", command=self._start)
         self._btn_start.pack(side="left", padx=5)
-        self._btn_stop = tk.Button(btn_frame, text="HALT", bg=PANEL_BORDER, fg=TEXT_DIM, activebackground=ALARM_RED, activeforeground="#000", font=("Consolas", 12, "bold"), width=12, relief="flat", state="disabled", command=self._stop)
-        self._btn_stop.pack(side="left", padx=5)
+        self._btn_soft_stop = tk.Button(btn_frame, text="SOFT HALT", bg=PANEL_BORDER, fg=TEXT_DIM, activebackground=WARNING, font=("Consolas", 12, "bold"), width=10, relief="flat", state="disabled", command=self._soft_stop)
+        self._btn_soft_stop.pack(side="left", padx=5)
+
+        self._btn_estop = tk.Button(btn_frame, text="E-STOP", bg=ALARM_RED, fg=BG_BASE, activebackground="#ff0000", font=("Consolas", 12, "bold"), width=10, relief="flat", state="disabled", command=self._trigger_estop)
+        self._btn_estop.pack(side="left", padx=5)
 
         # 3. Dynamic Pipeline Dashboard (Scalable Grid instead of Canvas)
         pipe_frame = tk.Frame(self, bg=BG_BASE)
@@ -263,19 +273,41 @@ class HMI(tk.Tk):
         self.after(2000, lambda: self._alarm_banner.config(text="SYSTEM CLEAR", bg=PANEL_BORDER, fg=TEXT_DIM))
 
     def _start(self):
+        # Check if we are resuming from an E-Stop
+        if hasattr(self, 'line') and not self.line._run_flag.is_set():
+            self.line._run_flag.set()
+            self._q.put({"type": EVT_STATUS, "msg": "SYSTEM: ONLINE - RESUMED"})
+            self._btn_start.config(state="disabled", fg=TEXT_DIM, text="INITIATE")
+            self._btn_estop.config(state="normal")
+            self._btn_soft_stop.config(state="normal", fg=WARNING)
+            self._alarm_banner.config(text="SYSTEM CLEAR", bg=PANEL_BORDER, fg=TEXT_DIM)
+            return
+
+        # Normal cold start
         if self._thread and self._thread.is_alive(): return
         self._stop_event.clear()
-        line = InstrumentedLine(self._q, self._stop_event)
-        self._thread = threading.Thread(target=line.run_until_stopped, daemon=True)
+        self.line = InstrumentedLine(self._q, self._stop_event) # Saved to self.line to access run_flag
+        self._thread = threading.Thread(target=self.line.run_until_stopped, daemon=True)
         self._thread.start()
         
-        self._btn_start.config(state="disabled", fg=TEXT_DIM)
-        self._btn_stop.config(state="normal", fg=ALARM_RED)
+        self._btn_start.config(state="disabled", fg=TEXT_DIM, text="INITIATE")
+        self._btn_soft_stop.config(state="normal", fg=WARNING)
+        self._btn_estop.config(state="normal")
 
-    def _stop(self):
-        self._stop_event.set()
-        self._btn_stop.config(state="disabled", fg=TEXT_DIM)
+    def _soft_stop(self):
+        self._stop_event.set() # Lets current loops finish out naturally
+        self._btn_soft_stop.config(state="disabled", fg=TEXT_DIM)
+        self._btn_estop.config(state="disabled")
+        self._q.put({"type": EVT_STATUS, "msg": "SYSTEM: SOFT HALT - FINISHING CYCLE"})
 
+    def _trigger_estop(self):
+        if self._thread and self._thread.is_alive():
+            self.line._run_flag.clear() # Instantly blocks the _stage wait loops
+            self._q.put({"type": EVT_STATUS, "msg": "SYSTEM: E-STOP ENGAGED - FROZEN"})
+            self._btn_start.config(state="normal", fg=OK_GREEN, text="RESUME")
+            self._btn_estop.config(state="disabled")
+            self._btn_soft_stop.config(state="disabled", fg=TEXT_DIM)
+            self._alarm_banner.config(text="E-STOP ACTIVE - PIPELINE FROZEN", bg=ALARM_RED, fg=BG_BASE)
     def _poll(self):
         try:
             while True:
