@@ -10,10 +10,22 @@ import random
 import time
 import threading
 from abc import ABC, abstractmethod
+
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Deque, List, Optional, Tuple
+
+from datetime import datetime, timezone
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+# --- INFLUXDB CONFIGURATION ---
+INFLUX_URL = "http://localhost:8086"
+INFLUX_TOKEN = "srh-secret-token-2026"
+INFLUX_ORG = "srh_university"
+INFLUX_BUCKET = "factory"
+
 
 class Quality(Enum):
     OK = auto()
@@ -172,15 +184,69 @@ class ProductionLine:
         self.stop_event = threading.Event()
 
         # Pass flags to all stations
-        all_stations = [*self.makers.values(), *self.qcs.values(), self.assembly, self.final_qc, self.packaging]
-        for s in all_stations:
+        self.all_stations = [*self.makers.values(), *self.qcs.values(), self.assembly, self.final_qc, self.packaging]
+        for s in self.all_stations:
             s.run_flag = self.run_flag
             s.stop_event = self.stop_event
+        # Start Telemetry Thread
+        self.telemetry_active = True
+        self.telemetry_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
+        self.telemetry_thread.start()
+
+    def _telemetry_loop(self):
+        """Runs in the background, pushing metrics to InfluxDB every second."""
+        client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+        write_api = client.write_api(write_options=SYNCHRONOUS)
+        
+        while self.telemetry_active:
+            # 1. Gather Metrics
+            total_rejects = sum(s.rejected for s in self.all_stations)
+            total_shipped = len(self.shipped)
+            
+            # 2. Determine State
+            if not self.run_flag.is_set():
+                state_str = "E-Stop"
+            elif self.stop_event.is_set():
+                state_str = "Soft Halt"
+            else:
+                state_str = "Running"
+                
+            # 3. Simulate Machine Temperature (for dashboard visuals)
+            temp = 60.0 + random.uniform(-2.0, 2.0) if state_str == "Running" else 40.0 + random.uniform(-0.5, 0.5)
+
+            # 4. Build and Send Point
+            point = (
+                Point("bearing_line")
+                .tag("location", "Berlin_Plant")
+                .field("shipped_total", total_shipped)
+                .field("rejects_total", total_rejects)
+                .field("state", state_str)
+                .field("temperature", temp)
+                .time(datetime.now(timezone.utc))
+            )
+            
+            try:
+                write_api.write(bucket=INFLUX_BUCKET, record=point)
+            except Exception as e:
+                print(f"\n[TELEMETRY ERROR]: {e}\n")# Silently ignore connection errors if the Docker container isn't running yet
+                
+            time.sleep(1)
+            
+        client.close()
 
     def _produce_lane(self, name: str) -> None:
         while not self.bins[name]:
             if self.stop_event.is_set(): return
+            
+            # 1. Make the raw part
             raw = self.makers[name].process()
+            
+            # 2. Pass it through Quality Control
+            inspected = self.qcs[name].process(raw)
+            
+            # 3. If it passes QC, put it in the bin for assembly
+            if inspected is not None:
+                self.bins[name].append(inspected)
 
     def _refill_bins(self) -> None:
         threads = []
@@ -194,7 +260,7 @@ class ProductionLine:
     def _assemble_one(self) -> Optional[BallBearing]:
         for n in self.COMPONENT_NAMES:
             if not self.bins[n]:
-                return Nonee
+                return None
         parts = {n: self.bins[n].popleft() for n in self.COMPONENT_NAMES}
         bearing = self.assembly.process(parts)
         bearing = self.final_qc.process(bearing)
@@ -209,6 +275,8 @@ class ProductionLine:
             self._refill_bins()
             if self.stop_event.is_set(): break
             bearing = self._assemble_one()
+            if bearing is not None:
+                self.shipped.append(bearing)
 
     def _report(self) -> None:
         print("\n=== Production report ===")
@@ -250,3 +318,4 @@ if __name__ == "__main__":
         time.sleep(0.05) # Keeps the CPU from maxing out while waiting for input
 
     prod_thread.join()
+    line.telemetry_active = False

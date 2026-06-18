@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  influxdb:
+    image: influxdb:2.7
+    container_name: factory_influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      # These auto-setup variables must perfectly match your Python script
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=srh_admin_2026!
+      - DOCKER_INFLUXDB_INIT_ORG=srh_university
+      - DOCKER_INFLUXDB_INIT_BUCKET=factory
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=srh-secret-token-2026
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    restart: always
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: factory_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      # Setting default Grafana login credentials
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=srh_admin_2026!
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - influxdb
+    restart: always
+
+# Persistent volumes ensure you don't lose your dashboard if the container stops
+volumes:
+  influxdb-data:
+  grafana-data:
