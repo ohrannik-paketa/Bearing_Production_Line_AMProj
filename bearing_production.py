@@ -268,9 +268,9 @@ class ProductionLine:
             return None
         return self.packaging.process(bearing)
 
-    def run(self, target: int) -> None:
-        print(f"\n=== Starting parallel production: target = {target} bearings ===\n")
-        while len(self.shipped) < target:
+    def run(self) -> None:
+        print("\n=== Starting perpetual parallel production ===\n")
+        while True:
             if self.stop_event.is_set(): break
             self._refill_bins()
             if self.stop_event.is_set(): break
@@ -290,7 +290,7 @@ if __name__ == "__main__":
     line = ProductionLine()
     
     # Run production in a background thread to keep the main thread free for controls
-    prod_thread = threading.Thread(target=line.run, args=(20,), daemon=True)
+    prod_thread = threading.Thread(target=line.run, daemon=True)
     prod_thread.start()
 
     print("\n--- CONTROLS (Press instantly, no Enter needed): [E]=E-Stop | [R]=Resume | [S]=Soft Halt | [Q]=Quit ---\n")
@@ -318,4 +318,9 @@ if __name__ == "__main__":
         time.sleep(0.05) # Keeps the CPU from maxing out while waiting for input
 
     prod_thread.join()
+
+    # Let telemetry run for 1.5 more seconds to broadcast the final Soft Halt / Quit state
+    print("\n[i] Syncing final machine state to SCADA...")
+    time.sleep(1.5)
+
     line.telemetry_active = False
